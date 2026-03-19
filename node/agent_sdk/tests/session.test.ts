@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SessionError } from "../errors";
-import type { StreamEvent, RunResult, ContentPart } from "../schema";
+import type { StreamEvent, RunResult, ContentPart, ReplayResult } from "../schema";
 
 // ============================================================================
 // Mock ProtocolClient
@@ -11,6 +11,7 @@ const mockStop = vi.fn();
 const mockSendPrompt = vi.fn();
 const mockSendCancel = vi.fn();
 const mockSendApproval = vi.fn();
+const mockSendReplay = vi.fn();
 let mockIsRunning = false;
 
 vi.mock("../protocol", () => ({
@@ -23,6 +24,7 @@ vi.mock("../protocol", () => ({
     sendPrompt: mockSendPrompt,
     sendCancel: mockSendCancel,
     sendApproval: mockSendApproval,
+    sendReplay: mockSendReplay,
   })),
 }));
 
@@ -71,6 +73,17 @@ function createFailingPromptStream(error: Error) {
       throw error;
     })(),
     result: resultPromise,
+  };
+}
+
+function createMockReplayStream(events: StreamEvent[], result: ReplayResult) {
+  return {
+    events: (async function* () {
+      for (const event of events) {
+        yield event;
+      }
+    })(),
+    result: Promise.resolve(result),
   };
 }
 
@@ -1402,5 +1415,111 @@ describe("Edge cases and error handling", () => {
     expect(received).toHaveLength(2);
     expect(received[0].type).toBe("CompactionBegin");
     expect(received[1].type).toBe("CompactionEnd");
+  });
+});
+
+// ============================================================================
+// replay() Tests
+// ============================================================================
+
+describe("Session replay()", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsRunning = false;
+    mockStart.mockResolvedValue(defaultInitializeResult);
+  });
+
+  it("throws SESSION_CLOSED when session is closed", async () => {
+    const session = createSession({ workDir: "/project" });
+    await session.close();
+
+    expect(() => session.replay()).toThrow(SessionError);
+    expect(() => session.replay()).toThrow("Session is closed");
+  });
+
+  it("throws SESSION_BUSY when session is active", () => {
+    const session = createSession({ workDir: "/project" });
+
+    mockIsRunning = true;
+    mockSendPrompt.mockReturnValue(createMockPromptStream([], { status: "finished" }));
+    session.prompt("Hello");
+
+    expect(session.state).toBe("active");
+    expect(() => session.replay()).toThrow(SessionError);
+    expect(() => session.replay()).toThrow("session is already active");
+  });
+
+  it("sets state to active during replay and back to idle when done", async () => {
+    const session = createSession({ workDir: "/project" });
+
+    mockIsRunning = true;
+    const replayResult: ReplayResult = { status: "finished", events: 5, requests: 1 };
+    mockSendReplay.mockReturnValue(createMockReplayStream([], replayResult));
+
+    const stream = session.replay();
+
+    expect(session.state).toBe("active");
+
+    for await (const _ of stream.events) {
+      // drain
+    }
+    await stream.result;
+
+    expect(session.state).toBe("idle");
+  });
+
+  it("replays events and returns ReplayResult", async () => {
+    const session = createSession({ workDir: "/project" });
+
+    mockIsRunning = true;
+    const events: StreamEvent[] = [
+      { type: "TurnBegin", payload: { user_input: "hello" } },
+      { type: "ContentPart", payload: { type: "text", text: "Hi there!" } },
+      { type: "TurnEnd", payload: {} },
+    ];
+    const replayResult: ReplayResult = { status: "finished", events: 3, requests: 0 };
+    mockSendReplay.mockReturnValue(createMockReplayStream(events, replayResult));
+
+    const stream = session.replay();
+
+    const received: StreamEvent[] = [];
+    for await (const event of stream.events) {
+      received.push(event);
+    }
+    const result = await stream.result;
+
+    expect(received).toHaveLength(3);
+    expect(received[0].type).toBe("TurnBegin");
+    expect(received[1].type).toBe("ContentPart");
+    expect(received[2].type).toBe("TurnEnd");
+    expect(result.status).toBe("finished");
+    expect(result.events).toBe(3);
+    expect(result.requests).toBe(0);
+  });
+
+  it("resets state to idle when replay errors", async () => {
+    const session = createSession({ workDir: "/project" });
+
+    mockIsRunning = true;
+    const error = new Error("Replay failed");
+    const resultPromise = Promise.reject(error);
+    resultPromise.catch(() => {}); // suppress unhandled rejection
+    mockSendReplay.mockReturnValue({
+      events: (async function* () {
+        throw error;
+      })(),
+      result: resultPromise,
+    });
+
+    const stream = session.replay();
+    expect(session.state).toBe("active");
+
+    await expect(async () => {
+      for await (const _ of stream.events) {
+        // drain
+      }
+    }).rejects.toThrow("Replay failed");
+
+    expect(session.state).toBe("idle");
   });
 });
