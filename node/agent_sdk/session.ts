@@ -1,8 +1,8 @@
 import * as crypto from "node:crypto";
-import { ProtocolClient, type ClientInfo } from "./protocol";
+import { ProtocolClient, type ClientInfo, type ReplayStream } from "./protocol";
 import { SessionError } from "./errors";
 import { log } from "./logger";
-import type { SessionOptions, ContentPart, StreamEvent, RunResult, ApprovalResponse, SlashCommandInfo, ExternalTool } from "./schema";
+import type { SessionOptions, ContentPart, StreamEvent, RunResult, ApprovalResponse, SlashCommandInfo, ExternalTool, ReplayResult } from "./schema";
 
 export type SessionState = "idle" | "active" | "closed";
 
@@ -61,6 +61,8 @@ export interface Session {
   setPlanMode(enabled: boolean): Promise<boolean>;
   /** Send a message, returns a Turn object */
   prompt(content: string | ContentPart[]): Turn;
+  /** Replay the session history, pulling all past events from the CLI */
+  replay(): ReplayStream;
   /** Close the session, release resources */
   close(): Promise<void>;
   /** Supports using syntax for automatic closure */
@@ -286,6 +288,52 @@ class SessionImpl implements Session {
     );
 
     return this.currentTurn;
+  }
+
+  replay(): ReplayStream {
+    if (this._state === "closed") {
+      throw new SessionError("SESSION_CLOSED", "Session is closed");
+    }
+    if (this._state === "active") {
+      throw new SessionError("SESSION_BUSY", "Cannot replay: session is already active");
+    }
+
+    this._state = "active";
+    log.session("Starting replay, state: %s", this._state);
+
+    const onComplete = () => {
+      if (this._state === "active") {
+        this._state = "idle";
+        log.session("Replay completed, state: %s", this._state);
+      }
+    };
+
+    let resolveResult!: (r: ReplayResult) => void;
+    let rejectResult!: (e: Error) => void;
+    const result = new Promise<ReplayResult>((res, rej) => {
+      resolveResult = res;
+      rejectResult = rej;
+    });
+    result.catch(() => {}); // suppress unhandled rejection
+
+    const self = this;
+    const events: AsyncIterable<StreamEvent> = (async function* () {
+      try {
+        const client = await self.getClientWithConfigCheck();
+        const stream = client.sendReplay();
+        for await (const event of stream.events) {
+          yield event;
+        }
+        resolveResult(await stream.result);
+      } catch (err) {
+        rejectResult(err as Error);
+        throw err;
+      } finally {
+        onComplete();
+      }
+    })();
+
+    return { events, result };
   }
 
   async close(): Promise<void> {
